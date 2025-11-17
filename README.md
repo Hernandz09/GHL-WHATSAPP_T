@@ -25,6 +25,26 @@ El servidor estará disponible en: **http://localhost:8080**
 
 ---
 
+## 💻 Frontend (Vite + React)
+
+Para visualizar y controlar el Gateway desde una UI en español se añadió la carpeta `frontend/` construida con **Vite + React + TypeScript**.
+
+```powershell
+cd frontend
+npm install          # la primera vez
+npm run dev          # abre http://localhost:5173
+```
+
+- La aplicación consume los mismos endpoints (`/api/wa/*` y `/api/send`) y permite:
+  - Generar QR y ver el código en pantalla.
+  - Consultar estado / cerrar sesión de instancias.
+  - Listar instancias activas y métricas básicas de la cola.
+  - Encolar mensajes de texto o imagen con un formulario.
+- Si el backend corre en una URL distinta, define `VITE_API_BASE_URL` antes de levantar Vite o ajusta el proxy en `frontend/vite.config.ts`.
+- Todos los estilos viven en `frontend/src/styles` para mantener consistencia.
+
+---
+
 ## 📋 Endpoints API para Postman
 
 ### 1️⃣ **Generar QR Code**

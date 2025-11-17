@@ -12,12 +12,16 @@ import fs from 'fs';
 import pino from 'pino';
 import { logger, logMessage } from '../utils/logger';
 import { notifyConnectionAlert } from '../utils/monitoring';
+import { getRedisClient } from '../infra/redisClient';
 import { addPendingImageMessage, addPendingTextMessage, consumePendingMessages } from './pendingMessages';
 
 // Store de sockets y QR codes
 const activeSockets: Map<string, WASocket> = new Map();
 const qrCodes: Map<string, string> = new Map();
 const connectionStatus: Map<string, 'disconnected' | 'connecting' | 'connected'> = new Map();
+const instanceNumbers: Map<string, string> = new Map();
+// Anti-duplicados: registrar IDs de mensajes ya procesados por instancia
+const processedMessageIds: Map<string, Map<string, number>> = new Map();
 const normalizeText = (value: string) =>
   value
     .normalize('NFD')
@@ -46,6 +50,81 @@ const jidToNormalizedNumber = (jid?: string | null): string | null => {
   const digits = raw.replace(/[^\d]/g, '');
   return digits || null;
 };
+
+const isInternalContact = (jid?: string | null): boolean => {
+  const normalized = jidToNormalizedNumber(jid);
+  if (!normalized) return false;
+  return Array.from(instanceNumbers.values()).includes(normalized);
+};
+
+const isInternalDestination = (identifier: string): boolean => {
+  let normalized: string | null = null;
+  if (identifier.includes('@')) {
+    normalized = jidToNormalizedNumber(identifier);
+  } else {
+    try {
+      normalized = normalizePhoneInput(identifier);
+    } catch {
+      normalized = null;
+    }
+  }
+  if (!normalized) return false;
+  return Array.from(instanceNumbers.values()).includes(normalized);
+};
+
+// Redis-backed global registry to avoid loops across processes
+const REDIS_INSTANCE_NUMBERS_KEY = 'instances:numbers';
+
+async function registerInstanceNumber(instanceId: string, normalizedNumber: string): Promise<void> {
+  try {
+    const redis = getRedisClient();
+    await redis.hset(REDIS_INSTANCE_NUMBERS_KEY, instanceId, normalizedNumber);
+  } catch (e) {
+    console.warn('No se pudo registrar número de instancia en Redis:', (e as Error)?.message);
+  }
+}
+
+async function unregisterInstanceNumber(instanceId: string): Promise<void> {
+  try {
+    const redis = getRedisClient();
+    await redis.hdel(REDIS_INSTANCE_NUMBERS_KEY, instanceId);
+  } catch (e) {
+    console.warn('No se pudo eliminar número de instancia en Redis:', (e as Error)?.message);
+  }
+}
+
+async function isInternalNumberGlobal(normalized: string): Promise<boolean> {
+  try {
+    const redis = getRedisClient();
+    const all = await redis.hvals(REDIS_INSTANCE_NUMBERS_KEY);
+    return all.includes(normalized);
+  } catch {
+    return false;
+  }
+}
+
+async function isInternalContactAsync(jid?: string | null): Promise<boolean> {
+  const normalized = jidToNormalizedNumber(jid);
+  if (!normalized) return false;
+  if (Array.from(instanceNumbers.values()).includes(normalized)) return true;
+  return await isInternalNumberGlobal(normalized);
+}
+
+async function isInternalDestinationAsync(identifier: string): Promise<boolean> {
+  let normalized: string | null = null;
+  if (identifier.includes('@')) {
+    normalized = jidToNormalizedNumber(identifier);
+  } else {
+    try {
+      normalized = normalizePhoneInput(identifier);
+    } catch {
+      normalized = null;
+    }
+  }
+  if (!normalized) return false;
+  if (Array.from(instanceNumbers.values()).includes(normalized)) return true;
+  return await isInternalNumberGlobal(normalized);
+}
 
 class WaitingForContactError extends Error {
   public code = 'WAITING_CONTACT';
@@ -167,6 +246,7 @@ export async function initInstance(instanceId: string, force: boolean = false): 
     activeSockets.delete(instanceId);
     qrCodes.delete(instanceId);
     connectionStatus.delete(instanceId);
+    instanceNumbers.delete(instanceId);
     logger.info(`[${instanceId}] Instancia anterior limpiada`);
   }
 
@@ -272,6 +352,11 @@ export async function initInstance(instanceId: string, force: boolean = false): 
       logMessage.connection(instanceId, 'connected');
       connectionStatus.set(instanceId, 'connected');
       qrCodes.delete(instanceId); // Limpiar QR después de conectar
+      const normalizedSelf = jidToNormalizedNumber(sock.user?.id);
+      if (normalizedSelf) {
+        instanceNumbers.set(instanceId, normalizedSelf);
+        await registerInstanceNumber(instanceId, normalizedSelf);
+      }
       console.log(`[${instanceId}] ✅ Socket abierto y listo para enviar mensajes`);
       console.log(`[${instanceId}] Usuario autenticado:`, sock.user ? 'Sí' : 'No');
       if (sock.user) {
@@ -298,11 +383,15 @@ export async function initInstance(instanceId: string, force: boolean = false): 
         logger.info(`[${instanceId}] Reconectando en 3s...`);
         connectionStatus.set(instanceId, 'connecting');
         activeSockets.delete(instanceId);
+        instanceNumbers.delete(instanceId);
+        await unregisterInstanceNumber(instanceId);
         setTimeout(() => initInstance(instanceId), 3000);
       } else {
         logMessage.connection(instanceId, 'disconnected', { reason: 'logged_out' });
         connectionStatus.set(instanceId, 'disconnected');
         activeSockets.delete(instanceId);
+        instanceNumbers.delete(instanceId);
+        await unregisterInstanceNumber(instanceId);
       }
 
       await notifyConnectionAlert({
@@ -337,14 +426,55 @@ export async function initInstance(instanceId: string, force: boolean = false): 
       .map((keyword) => normalizeText(keyword))
       .filter(Boolean);
 
+    // Inicializar registro anti-duplicados para esta instancia
+    if (!processedMessageIds.has(instanceId)) {
+      processedMessageIds.set(instanceId, new Map());
+    }
+    const seenIds = processedMessageIds.get(instanceId)!;
+
+    // Limpieza simple: eliminar entradas con más de 10 minutos para evitar crecer sin límite
+    const now = Date.now();
+    for (const [mid, ts] of Array.from(seenIds.entries())) {
+      if (now - ts > 10 * 60 * 1000) {
+        seenIds.delete(mid);
+      }
+    }
+
     for (const msg of m.messages) {
       if (!msg.message || msg.key.fromMe) continue;
 
-      const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
       const from = msg.key.remoteJid;
+
+      if (from && (await isInternalContactAsync(from))) {
+        logger.debug('Ignorando mensajes internos para evitar bucles', {
+          event: 'message.internal.skip',
+          instanceId,
+          from,
+        });
+        continue;
+      }
+
+      const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
       if (text && from) {
         const normalizedText = normalizeText(text);
+
+        // Clave de deduplicación robusta: usa ID de WhatsApp si existe; si no, usa combinación estable
+        const dedupeKey =
+          msg.key.id ||
+          `${from}|${normalizedText}|${String(msg.messageTimestamp || '')}`;
+
+        // Evitar procesar duplicados (Baileys puede emitir el mismo mensaje 2 veces)
+        if (dedupeKey) {
+          if (seenIds.has(dedupeKey)) {
+            continue;
+          }
+          seenIds.set(dedupeKey, Date.now());
+          if (seenIds.size > 1000) {
+            const oldestKey = Array.from(seenIds.entries()).sort((a, b) => a[1] - b[1])[0]?.[0];
+            if (oldestKey) seenIds.delete(oldestKey);
+          }
+        }
 
         // Log del mensaje recibido
         console.log(`\n[${instanceId}] 📩 MENSAJE RECIBIDO:`);
@@ -438,6 +568,10 @@ export async function sendTextMessage(instanceId: string, to: string, message: s
   const sock = activeSockets.get(instanceId);
   if (!sock) {
     throw new Error(`Instancia ${instanceId} no está conectada - socket no encontrado`);
+  }
+
+  if (await isInternalDestinationAsync(to)) {
+    throw new Error(`No se puede enviar mensajes entre instancias internas (${to}).`);
   }
 
   // Verificar estado de conexión
@@ -600,6 +734,10 @@ export async function sendImageMessage(instanceId: string, to: string, imageUrl:
     throw new Error(`Instancia ${instanceId} no está conectada`);
   }
 
+  if (await isInternalDestinationAsync(to)) {
+    throw new Error(`No se puede enviar imágenes entre instancias internas (${to}).`);
+  }
+
   // Verificar que el socket esté realmente conectado
   if (sock.user === undefined) {
     throw new Error(`Socket de ${instanceId} no está autenticado`);
@@ -681,6 +819,8 @@ export async function logoutInstance(instanceId: string): Promise<void> {
     activeSockets.delete(instanceId);
     qrCodes.delete(instanceId);
     connectionStatus.set(instanceId, 'disconnected');
+    instanceNumbers.delete(instanceId);
+    await unregisterInstanceNumber(instanceId);
     logger.info(`[${instanceId}] Logout ejecutado`);
   }
 }

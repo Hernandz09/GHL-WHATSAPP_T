@@ -18,7 +18,7 @@ const redisConnection: RedisOptions = {
     }
     return Math.min(times * 200, 2000); // Delay exponencial
   },
-  enableOfflineQueue: true, // Encolar comandos si está offline
+  enableOfflineQueue: false, // No encolar comandos si está offline
 };
 
 // Tipos para los jobs

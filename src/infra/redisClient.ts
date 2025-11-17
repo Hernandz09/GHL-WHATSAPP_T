@@ -10,7 +10,7 @@ function buildOptions(): RedisOptions {
 
   return {
     maxRetriesPerRequest: null,
-    enableOfflineQueue: true,
+    enableOfflineQueue: false,
     lazyConnect: true,
     host,
     port,
@@ -23,7 +23,7 @@ export function getRedisClient(): Redis {
     redisClient = process.env.REDIS_URL
       ? new Redis(process.env.REDIS_URL, {
           maxRetriesPerRequest: null,
-          enableOfflineQueue: true,
+          enableOfflineQueue: false,
           lazyConnect: true,
         })
       : new Redis(buildOptions());

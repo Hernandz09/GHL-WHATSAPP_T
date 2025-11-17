@@ -1,20 +1,20 @@
 import { logger } from './logger';
 
-type ConnectionAlertPayload = {
+interface ConnectionAlertPayload {
   instanceId: string;
   status: 'connecting' | 'connected' | 'disconnected';
   reason?: string;
   details?: Record<string, any>;
-};
+}
 
-type QueueMetricsPayload = {
+interface QueueMetricsPayload {
   queue: string;
   counts: Record<string, number>;
   pendingMessages: {
     total: number;
     perInstance: Record<string, number>;
   };
-};
+}
 
 type MonitoringEvent =
   | {
@@ -22,9 +22,9 @@ type MonitoringEvent =
       payload: ConnectionAlertPayload;
     }
   | {
-    type: 'queue_metrics';
-    payload: QueueMetricsPayload;
-  };
+      type: 'queue_metrics';
+      payload: QueueMetricsPayload;
+    };
 
 const webhookUrl = process.env.MONITORING_WEBHOOK_URL;
 const webhookToken = process.env.MONITORING_WEBHOOK_TOKEN;

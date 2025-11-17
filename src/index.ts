@@ -1,5 +1,6 @@
 import express, { Express, Request, Response } from 'express';
 import dotenv from 'dotenv';
+import cors, { CorsOptions } from 'cors';
 import { qrRouter } from './api/qr.controller';
 import { sendRouter } from './api/send.controller';
 import { messageWorker } from './core/queue';
@@ -11,8 +12,19 @@ dotenv.config();
 
 const app: Express = express();
 const PORT = process.env.PORT || 8080;
+const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const corsOptions: CorsOptions = {
+  origin: allowedOrigins.length ? allowedOrigins : true,
+  credentials: true,
+};
 
 // Middleware
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
